@@ -7,6 +7,16 @@
 (define-constant ERR_SUBSCRIPTION_EXISTS (err u105))
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u106))
 
+(define-constant ERR_DISCOUNT_NOT_FOUND (err u201))
+(define-constant ERR_INVALID_PERCENTAGE (err u202))
+(define-constant ERR_REFERRAL_NOT_FOUND (err u203))
+(define-constant ERR_CANNOT_REFER_SELF (err u204))
+(define-constant ERR_TIER_NOT_FOUND (err u205))
+
+(define-data-var next-discount-id uint u1)
+(define-data-var referral-bonus-percentage uint u10)
+(define-data-var max-discount-percentage uint u50)
+
 (define-data-var subscription-fee uint u1000000)
 (define-data-var subscription-duration uint u2628000)
 (define-data-var total-subscribers uint u0)
@@ -236,4 +246,248 @@
 
 (define-read-only (bulk-check-subscriptions (subscribers (list 10 principal)))
   (map is-subscription-active subscribers)
+)
+
+
+
+(define-map discount-codes
+  { discount-id: uint }
+  {
+    code: (string-ascii 20),
+    percentage: uint,
+    max-uses: uint,
+    current-uses: uint,
+    creator: principal,
+    is-active: bool,
+    expires-at-block: uint
+  }
+)
+
+(define-map code-lookup
+  { code: (string-ascii 20) }
+  { discount-id: uint }
+)
+
+(define-map user-discounts
+  { user: principal, discount-id: uint }
+  { used-at-block: uint }
+)
+
+(define-map referral-links
+  { referrer: principal }
+  {
+    total-referrals: uint,
+    total-earned: uint,
+    is-active: bool
+  }
+)
+
+(define-map referral-uses
+  { referee: principal }
+  { referrer: principal, bonus-earned: uint }
+)
+
+(define-map loyalty-tiers
+  { tier-level: uint }
+  {
+    min-renewals: uint,
+    discount-percentage: uint,
+    tier-name: (string-ascii 30)
+  }
+)
+
+(define-map user-loyalty
+  { user: principal }
+  {
+    current-tier: uint,
+    total-renewals: uint,
+    tier-discount: uint
+  }
+)
+
+(define-public (create-discount-code (code (string-ascii 20)) (percentage uint) (max-uses uint) (expires-at-block uint))
+  (let
+    (
+      (discount-id (var-get next-discount-id))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= percentage (var-get max-discount-percentage)) ERR_INVALID_PERCENTAGE)
+    (map-set discount-codes
+      { discount-id: discount-id }
+      {
+        code: code,
+        percentage: percentage,
+        max-uses: max-uses,
+        current-uses: u0,
+        creator: tx-sender,
+        is-active: true,
+        expires-at-block: expires-at-block
+      }
+    )
+    (map-set code-lookup { code: code } { discount-id: discount-id })
+    (var-set next-discount-id (+ discount-id u1))
+    (ok discount-id)
+  )
+)
+
+(define-public (use-discount-code (code (string-ascii 20)) (user principal))
+  (let
+    (
+      (discount-lookup (unwrap! (map-get? code-lookup { code: code }) ERR_DISCOUNT_NOT_FOUND))
+      (discount-id (get discount-id discount-lookup))
+      (discount (unwrap! (map-get? discount-codes { discount-id: discount-id }) ERR_DISCOUNT_NOT_FOUND))
+    )
+    (asserts! (get is-active discount) ERR_DISCOUNT_NOT_FOUND)
+    (asserts! (< (get current-uses discount) (get max-uses discount)) ERR_DISCOUNT_NOT_FOUND)
+    (asserts! (> (get expires-at-block discount) stacks-block-height) ERR_DISCOUNT_NOT_FOUND)
+    (map-set discount-codes
+      { discount-id: discount-id }
+      (merge discount { current-uses: (+ (get current-uses discount) u1) })
+    )
+    (map-set user-discounts
+      { user: user, discount-id: discount-id }
+      { used-at-block: stacks-block-height }
+    )
+    (ok (get percentage discount))
+  )
+)
+
+(define-public (create-referral-link)
+  (begin
+    (map-set referral-links
+      { referrer: tx-sender }
+      {
+        total-referrals: u0,
+        total-earned: u0,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (use-referral (referrer principal) (referee principal))
+  (let
+    (
+      (referral-data (unwrap! (map-get? referral-links { referrer: referrer }) ERR_REFERRAL_NOT_FOUND))
+      (bonus-percentage (var-get referral-bonus-percentage))
+    )
+    (asserts! (not (is-eq referrer referee)) ERR_CANNOT_REFER_SELF)
+    (asserts! (get is-active referral-data) ERR_REFERRAL_NOT_FOUND)
+    (map-set referral-links
+      { referrer: referrer }
+      (merge referral-data { 
+        total-referrals: (+ (get total-referrals referral-data) u1),
+        total-earned: (+ (get total-earned referral-data) bonus-percentage)
+      })
+    )
+    (map-set referral-uses
+      { referee: referee }
+      { referrer: referrer, bonus-earned: bonus-percentage }
+    )
+    (ok bonus-percentage)
+  )
+)
+
+(define-public (setup-loyalty-tier (tier-level uint) (min-renewals uint) (discount-percentage uint) (tier-name (string-ascii 30)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= discount-percentage (var-get max-discount-percentage)) ERR_INVALID_PERCENTAGE)
+    (map-set loyalty-tiers
+      { tier-level: tier-level }
+      {
+        min-renewals: min-renewals,
+        discount-percentage: discount-percentage,
+        tier-name: tier-name
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-user-loyalty (user principal) (renewal-count uint))
+  (let
+    (
+      (current-loyalty (default-to { current-tier: u0, total-renewals: u0, tier-discount: u0 }
+                                   (map-get? user-loyalty { user: user })))
+      (new-tier (calculate-tier renewal-count))
+      (tier-data (map-get? loyalty-tiers { tier-level: new-tier }))
+    )
+    (map-set user-loyalty
+      { user: user }
+      {
+        current-tier: new-tier,
+        total-renewals: renewal-count,
+        tier-discount: (match tier-data
+                        tier (get discount-percentage tier)
+                        u0)
+      }
+    )
+    (ok new-tier)
+  )
+)
+
+(define-private (calculate-tier (renewals uint))
+  (if (>= renewals u20) u4
+    (if (>= renewals u10) u3
+      (if (>= renewals u5) u2
+        (if (>= renewals u1) u1 u0)))))
+
+(define-public (calculate-final-discount (user principal) (base-amount uint))
+  (let
+    (
+      (loyalty-data (map-get? user-loyalty { user: user }))
+      (loyalty-discount (match loyalty-data
+                         data (get tier-discount data)
+                         u0))
+      (discount-amount (/ (* base-amount loyalty-discount) u100))
+    )
+    (ok (- base-amount discount-amount))
+  )
+)
+
+(define-public (deactivate-discount (discount-id uint))
+  (let
+    (
+      (discount (unwrap! (map-get? discount-codes { discount-id: discount-id }) ERR_DISCOUNT_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set discount-codes
+      { discount-id: discount-id }
+      (merge discount { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-discount-by-code (code (string-ascii 20)))
+  (match (map-get? code-lookup { code: code })
+    lookup
+      (map-get? discount-codes { discount-id: (get discount-id lookup) })
+    none
+  )
+)
+
+(define-read-only (get-user-loyalty (user principal))
+  (map-get? user-loyalty { user: user })
+)
+
+(define-read-only (get-referral-data (referrer principal))
+  (map-get? referral-links { referrer: referrer })
+)
+
+(define-read-only (get-tier-info (tier-level uint))
+  (map-get? loyalty-tiers { tier-level: tier-level })
+)
+
+(define-read-only (has-used-discount (user principal) (discount-id uint))
+  (is-some (map-get? user-discounts { user: user, discount-id: discount-id }))
+)
+
+(define-read-only (get-referral-bonus-percentage)
+  (var-get referral-bonus-percentage)
+)
+
+(define-read-only (get-max-discount-percentage)
+  (var-get max-discount-percentage)
 )
